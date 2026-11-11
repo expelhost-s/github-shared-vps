@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+ExpelHost VPS Bot  -  made by ExpelHost
 Docker VPS Bot  (no LXC / LXD needed)
 -------------------------------------
 * Every VPS is a Docker container (Ubuntu 22.04 / 24.04).
@@ -22,13 +23,16 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("PREFIX", "2")
-BRAND = os.getenv("BRAND", "FLOATIX")
+BRAND = os.getenv("BRAND", "ExpelHost")
+CREDIT = "ExpelHost"
 LOGO = os.getenv("BRAND_LOGO_URL", "")
 BANNER = os.getenv("BRAND_BANNER_URL", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 EXPIRY_DAYS = int(os.getenv("EXPIRY_DAYS", "30"))          # 0 = never expires
 ENFORCE_LIMITS = os.getenv("ENFORCE_LIMITS", "false").lower() in ("1", "true", "yes")
-STORAGE_MODE = os.getenv("STORAGE_MODE", "auto")           # auto | opt | loop
+STORAGE_MODE = os.getenv("STORAGE_MODE", "loop")           # loop (dedicated, resizable) | opt | auto
+LIVE_INTERVAL = max(3, int(os.getenv("LIVE_INTERVAL", "5")))   # seconds between live panel refreshes
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_VPS_LIMIT", "3"))       # default max VPS per user (admins exempt)
 DISK_DIR = os.getenv("DISK_DIR", "/var/lib/vpsbot")
 DB_PATH = os.getenv("DB_PATH", "vpsbot.db")
 OS_OPTIONS = [("Ubuntu 22.04", "ubuntu:22.04"), ("Ubuntu 24.04", "ubuntu:24.04")]
@@ -41,11 +45,16 @@ db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS user_limits(user_id INTEGER PRIMARY KEY, max_vps INTEGER);
 CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT DEFAULT '', max_vps INTEGER DEFAULT 50);
 CREATE TABLE IF NOT EXISTS vps(id TEXT PRIMARY KEY, owner INTEGER, node_id INTEGER, image TEXT,
   ram INTEGER, cpu INTEGER, disk INTEGER, mode TEXT DEFAULT 'opt', created TEXT, expires TEXT,
   purge INTEGER DEFAULT 0, free INTEGER DEFAULT 0);
 """)
+try:  # remembers the DM control-panel message so its buttons keep working after a restart
+    db.execute("ALTER TABLE vps ADD COLUMN dm_msg INTEGER")
+except sqlite3.OperationalError:
+    pass
 if not db.execute("SELECT 1 FROM nodes").fetchone():
     db.execute("INSERT INTO nodes(name, host) VALUES('Local', '')")
 db.commit()
@@ -132,9 +141,16 @@ async def host_sh(node, script, timeout=300):
 def disk_script(name, gb):
     d = f"{DISK_DIR}/{name}"
     return (f"set -e; mkdir -p {d}/mnt; "
-            f"[ -f {d}/disk.img ] || {{ truncate -s {gb}G {d}/disk.img && mkfs.ext4 -q -F {d}/disk.img; }}; "
+            f"[ -f {d}/disk.img ] || {{ truncate -s {gb}G {d}/disk.img && mkfs.ext4 -q -F -m 0 {d}/disk.img; }}; "
             f"mountpoint -q {d}/mnt || mount -o loop {d}/disk.img {d}/mnt; "
+            f"dev=$(losetup -j {d}/disk.img | head -n1 | cut -d: -f1); [ -n \"$dev\" ] && resize2fs $dev >/dev/null 2>&1 || true; "
             f"mkdir -p {d}/mnt/root {d}/mnt/home; chmod 700 {d}/mnt/root")
+
+
+def grow_script(name, gb):
+    d = f"{DISK_DIR}/{name}"
+    return (f"set -e; truncate -s {gb}G {d}/disk.img; dev=$(losetup -j {d}/disk.img | head -n1 | cut -d: -f1); "
+            f"if [ -n \"$dev\" ]; then losetup -c $dev; resize2fs $dev >/dev/null 2>&1 || true; fi")
 
 
 SETUP_SH = ("export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && "
@@ -162,6 +178,8 @@ echo "timed out waiting for sshx" >&2; exit 1
 
 async def destroy(v):
     node, n = get_node(v["node_id"]), cname(v)
+    for c in (INFO_CACHE, DISK_CACHE, HIST):
+        c.pop(v["id"], None)
     await dock(node, "rm", "-f", n)
     if v["mode"] == "loop":
         d = f"{DISK_DIR}/{n}"
@@ -206,6 +224,7 @@ async def provision(v, progress, fresh=True):
 
 async def lifecycle(v, action):
     node, n = get_node(v["node_id"]), cname(v)
+    INFO_CACHE.pop(v["id"], None)
     if action in ("start", "restart") and v["mode"] == "loop":
         rc, _, e = await host_sh(node, disk_script(n, v["disk"]))
         if rc:
@@ -223,31 +242,68 @@ def to_mb(text):
     return float(m.group(1)) * f
 
 
+INFO_CACHE, DISK_CACHE, HIST = {}, {}, {}
+_sem = None
+PROBE = r"""df -Pk /root | tail -n1; ping -c1 -W1 1.1.1.1 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p'"""
+
+
+def sem():
+    global _sem
+    if _sem is None:
+        _sem = asyncio.Semaphore(4)
+    return _sem
+
+
 async def info(v):
+    c = INFO_CACHE.get(v["id"])
+    if c and time.time() - c[0] < 2:
+        return c[1]
+    async with sem():
+        d = await _info(v)
+    INFO_CACHE[v["id"]] = (time.time(), d)
+    return d
+
+
+async def _info(v):
     node, n = get_node(v["node_id"]), cname(v)
+    t0 = time.perf_counter()
     rc, o, _ = await dock(node, "inspect", "-f", "{{.State.Status}}|{{.State.StartedAt}}", n)
+    node_ms = (time.perf_counter() - t0) * 1000
     if rc:
-        return {"state": "missing"}
+        return {"state": "missing", "node_ms": node_ms}
     state, started = o.split("|", 1)
-    d = {"state": state, "started": started, "cpu": 0.0, "ram": 0.0, "disk": None}
+    d = {"state": state, "started": started, "cpu": 0.0, "ram": 0.0, "disk": None, "net": None, "ping": None, "node_ms": node_ms}
     if state != "running":
         return d
-    rc, o, _ = await dock(node, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}", n)
-    if rc == 0 and "|" in o:
-        c, m = o.split("|", 1)
+    (src_, so, _), (prc, po, _) = await asyncio.gather(
+        dock(node, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}", n),
+        dock(node, "exec", n, "sh", "-c", PROBE, timeout=10))
+    if src_ == 0 and so.count("|") >= 2:
+        c, m, nio = so.split("|", 2)
         try:
             d["cpu"] = float(c.strip().rstrip("%"))
         except ValueError:
             pass
         d["ram"] = to_mb(m.split("/")[0])
-    if v["mode"] == "loop":
-        rc, o, _ = await dock(node, "exec", n, "df", "-Pk", "/root")
-        if rc == 0 and len(o.splitlines()) > 1:
-            d["disk"] = int(o.splitlines()[-1].split()[2]) / 1048576
-    else:
-        rc, o, _ = await dock(node, "inspect", "-s", "-f", "{{.SizeRw}}", n)
-        if rc == 0 and o.isdigit():
-            d["disk"] = int(o) / 1073741824
+        if "/" in nio:
+            rx, tx = [x.strip() for x in nio.split("/", 1)]
+            d["net"] = (rx, tx)
+    for line in (po.splitlines() if prc == 0 else []):
+        parts = line.split()
+        if len(parts) >= 5 and v["mode"] == "loop":
+            try:
+                d["disk"] = int(parts[2]) / 1048576
+            except ValueError:
+                pass
+        elif re.fullmatch(r"[\d.]+", line.strip()):
+            d["ping"] = float(line.strip())
+    if v["mode"] != "loop":
+        ts, val = DISK_CACHE.get(v["id"], (0, None))
+        if time.time() - ts > 30:
+            rc, o, _ = await dock(node, "inspect", "-s", "-f", "{{.SizeRw}}", n)
+            val = int(o) / 1073741824 if rc == 0 and o.isdigit() else val
+            DISK_CACHE[v["id"]] = (time.time(), val)
+        d["disk"] = val
     return d
 
 
@@ -260,9 +316,24 @@ async def sshx_link(v):
     return o.splitlines()[-1].strip()
 
 # ───────────────────────────── formatting ─────────────────────────────
-def bar(p, n=10):
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def bar(p, n=12, frame=None):
     f = round(min(max(p, 0), 100) / 100 * n)
-    return "[" + "█" * f + "░" * (n - f) + "]"
+    cells = ["█"] * f + ["░"] * (n - f)
+    if frame is not None and f > 1:          # moving shimmer = animated bar
+        cells[frame % f] = "▓"
+    return "[" + "".join(cells) + "]"
+
+
+def spark(vals):
+    return "".join(SPARK[min(7, int(x / 100 * 7.99))] for x in vals) or "▁"
+
+
+def ms(x, dec=0):
+    return "—" if x is None else f"{x:.{dec}f} ms"
 
 
 def dur(sec):
@@ -270,7 +341,7 @@ def dur(sec):
     d, r = divmod(sec, 86400)
     h, r = divmod(r, 3600)
     m, s = divmod(r, 60)
-    return f"{d}d {h}h {m}m" if d else f"{h}h {m}m" if h else f"{m}m {s}s"
+    return f"{d}d {h}h {m}m {s}s" if d else f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
 
 def expired(v):
@@ -283,14 +354,20 @@ def fmt_exp(v):
     delta = datetime.fromisoformat(v["expires"]) - now()
     if delta.total_seconds() < 0:
         return "Expired"
-    return f"in {delta.days} days" if delta.days else f"in {delta.seconds // 3600} hours"
+    return f"in {delta.days}d {delta.seconds // 3600}h" if delta.days else f"in {delta.seconds // 3600}h {delta.seconds % 3600 // 60}m"
 
 
-async def build_panel(v):
+def footer_text():
+    return "Powered by ExpelHost" if BRAND == CREDIT else f"{BRAND} • Made by {CREDIT}"
+
+
+async def build_panel(v, frame=None):
     i = await info(v)
     st = i["state"]
-    color = {"running": 0x2ECC71, "missing": 0x95A5A6}.get(st, 0xE74C3C)
-    e = discord.Embed(title=f"⚙️ {BRAND} VPS Panel (Secure)", color=color)
+    live = frame is not None
+    f = frame or 0
+    color = {"running": (0x2ECC71, 0x1FA85A)[f % 2], "missing": 0x95A5A6}.get(st, 0xE74C3C)
+    e = discord.Embed(title=f"{SPIN[f % len(SPIN)] if live else '⚙️'} {BRAND} VPS Panel (Secure)", color=color)
     status = {"running": "🟢 Running", "missing": "⚠️ Container missing"}.get(st, "🔴 Stopped")
     up = "—"
     if st == "running":
@@ -299,29 +376,91 @@ async def build_panel(v):
             up = f"{dur((now() - t).total_seconds())} ago"
         except ValueError:
             pass
-    desc = (f"**VPS No:** `{vps_number(v)}` | **ID:** `{v['id']}`\n"
-            f"**OS:** `{dict((b, a) for a, b in OS_OPTIONS).get(v['image'], v['image'])}`\n\n"
-            f"**Status:** {status}\n**Uptime:** `{up}`\n**Expires:** `{fmt_exp(v)}`\n\n")
+    desc = ""
+    if live:
+        desc += f"{'🔴' if f % 2 == 0 else '⚫'} **LIVE** • updates every {LIVE_INTERVAL}s\n\n"
+    desc += (f"**VPS No:** `{vps_number(v)}` | **ID:** `{v['id']}`\n"
+             f"**OS:** `{dict((b, a) for a, b in OS_OPTIONS).get(v['image'], v['image'])}`\n\n"
+             f"**Status:** {status}\n**Uptime:** `{up}`\n**Expires:** `{fmt_exp(v)}`\n\n")
     if st == "running":
         cpu = min(100.0, i["cpu"] / max(v["cpu"], 1))
+        h = HIST.setdefault(v["id"], __import__("collections").deque(maxlen=16))
+        h.append(cpu)
         lvl = "Normal" if cpu < 60 else "High" if cpu < 85 else "Critical"
         ram_t = v["ram"] * 1024
         rp = i["ram"] / ram_t * 100 if ram_t else 0
         du = i["disk"]
         dp = (du / v["disk"] * 100) if (du is not None and v["disk"]) else 0
-        disk_line = (f"💽 **Disk:** {du:.1f} GB / {v['disk']} GB\n{bar(dp)} {dp:.1f}%\n" if du is not None
-                     else f"💽 **Disk:** — / {v['disk']} GB\n")
-        desc += (f"📊 **Live Stats:**\n🖥️ **CPU:** {lvl} {bar(cpu)} {cpu:.2f}%\n"
-                 f"🧠 **RAM:** {i['ram']:.2f} MB / {ram_t} MB\n{bar(rp)} {rp:.1f}%\n" + disk_line)
+        kind = "dedicated" if v["mode"] == "loop" else "quota"
+        disk_line = (f"💽 **Disk ({kind}):** {du:.1f} GB / {v['disk']} GB\n{bar(dp, 12, frame)} {dp:.1f}%\n" if du is not None
+                     else f"💽 **Disk ({kind}):** — / {v['disk']} GB\n")
+        net = f"🌐 **Network:** ↓ `{i['net'][0]}` • ↑ `{i['net'][1]}`\n" if i.get("net") else ""
+        desc += (f"📊 **Live Stats:**\n🖥️ **CPU:** {lvl} {bar(cpu, 12, frame)} {cpu:.2f}%\n"
+                 f"`{spark(h)}` CPU history\n"
+                 f"🧠 **RAM:** {i['ram']:.2f} MB / {ram_t} MB\n{bar(rp, 12, frame)} {rp:.1f}%\n" + disk_line + net +
+                 f"📡 **Ping:** Bot `{ms(bot.latency * 1000)}` • Node `{ms(i['node_ms'])}` • VPS→Internet `{ms(i['ping'], 1)}`\n")
     else:
-        desc += (f"📊 **Spec:** {v['ram']} GB RAM (shared) • {v['cpu']} CPU (shared) • {v['disk']} GB disk\n")
+        desc += (f"📊 **Spec:** {v['ram']} GB RAM (shared) • {v['cpu']} CPU (shared) • {v['disk']} GB disk\n"
+                 f"📡 **Node ping:** `{ms(i.get('node_ms'))}`\n")
     desc += f"🔒 **Purge Protection:** {'🔐 Enabled' if v['purge'] else '🔓 Disabled'}"
     e.description = desc
     if LOGO:
         e.set_thumbnail(url=LOGO)
     if BANNER:
         e.set_image(url=BANNER)
-    e.set_footer(text=f"Powered by {BRAND}")
+    e.set_footer(text=footer_text())
+    e.timestamp = discord.utils.utcnow()
+    return e
+
+
+# ───────────────────────── fleet stats + dashboard ─────────────────────────
+FLEET = {"total": 0, "cap": 0, "running": 0, "nodes": []}
+TICK = 0
+
+
+async def _node_probe(nd):
+    t0 = time.perf_counter()
+    rc, o, _ = await dock(nd, "ps", "--filter", "label=vpsbot=1", "--format", "{{.Names}}", timeout=15)
+    return {"name": nd["name"], "id": nd["id"], "max": nd["max_vps"], "ok": rc == 0,
+            "ms": (time.perf_counter() - t0) * 1000, "running": len(o.split()) if rc == 0 else 0,
+            "used": q("SELECT COUNT(*) c FROM vps WHERE node_id=?", nd["id"])[0]["c"]}
+
+
+async def refresh_fleet():
+    nodes = await asyncio.gather(*[_node_probe(n) for n in q("SELECT * FROM nodes")])
+    FLEET.update(total=q("SELECT COUNT(*) c FROM vps")[0]["c"], cap=sum(n["max_vps"] for n in q("SELECT * FROM nodes")),
+                 running=sum(n["running"] for n in nodes), nodes=list(nodes))
+
+
+def host_info():
+    try:
+        host = dur(float(open("/proc/uptime").read().split()[0]))
+    except OSError:
+        host = "n/a"
+    try:
+        load = " / ".join(f"{x:.2f}" for x in os.getloadavg())
+    except OSError:
+        load = "n/a"
+    return host, load
+
+
+def build_dashboard():
+    f = TICK
+    host, load = host_info()
+    t, c, r = FLEET["total"], FLEET["cap"], FLEET["running"]
+    e = discord.Embed(title=f"{SPIN[f % len(SPIN)]} {BRAND} Live Dashboard", color=(0x5865F2, 0x7289DA)[f % 2])
+    e.description = (f"{'🔴' if f % 2 == 0 else '⚫'} **LIVE** • updates every 10s\n\n"
+                     f"🖥️ **VPS:** `{t}/{c}` {bar(t / c * 100 if c else 0, 14, f)}\n"
+                     f"🟢 **Running:** `{r}`  🔴 **Stopped:** `{max(t - r, 0)}`\n"
+                     f"👥 **Users:** `{q('SELECT COUNT(DISTINCT owner) c FROM vps')[0]['c']}`\n\n"
+                     f"📡 **Bot ping:** `{ms(bot.latency * 1000)}`\n"
+                     f"⏱️ **Bot uptime:** `{dur(time.time() - START_TIME)}`\n"
+                     f"🖧 **Host uptime:** `{host}`\n⚙️ **Load (1/5/15m):** `{load}`")
+    e.add_field(name="🖧 Nodes", value="\n".join(
+        f"{'🟢' if n['ok'] else '🔴'} **{n['name']}** • `{ms(n['ms'])}` • {n['used']}/{n['max']} VPS • {n['running']} running"
+        for n in FLEET["nodes"]) or "—", inline=False)
+    e.set_footer(text=footer_text())
+    e.timestamp = discord.utils.utcnow()
     return e
 
 
@@ -394,7 +533,52 @@ async def pick_os(ctx):
     return val
 
 
-async def deploy_flow(ctx, owner, ram, cpu, disk, free=False):
+def user_limit(uid):
+    r = q("SELECT max_vps FROM user_limits WHERE user_id=?", uid)
+    return r[0]["max_vps"] if r else int(get_set("default_limit", str(DEFAULT_LIMIT)))
+
+
+def user_count(uid):
+    return q("SELECT COUNT(*) c FROM vps WHERE owner=?", uid)[0]["c"]
+
+
+async def apply_edit(v, ram, cpu, disk, add_days=0):
+    """Admin edit. Returns a list of human-readable notes."""
+    notes, node, n = [], get_node(v["node_id"]), cname(v)
+    if disk < v["disk"]:
+        notes.append(f"⚠️ Disk shrink is not supported (protects user data) – kept {v['disk']} GB.")
+        disk = v["disk"]
+    elif disk > v["disk"]:
+        if v["mode"] == "loop":
+            rc, _, e = await host_sh(node, grow_script(n, disk))
+            if rc:
+                notes.append(f"⚠️ Disk grow failed: `{e[-200:]}`")
+                disk = v["disk"]
+            else:
+                notes.append(f"💽 Disk grown to **{disk} GB** (live, no data loss).")
+        else:
+            notes.append("⚠️ `opt` storage can't be resized live – kept. Use STORAGE_MODE=loop for resizable disks.")
+            disk = v["disk"]
+    ex("UPDATE vps SET ram=?, cpu=?, disk=? WHERE id=?", ram, cpu, disk, v["id"])
+    if ENFORCE_LIMITS and (ram != v["ram"] or cpu != v["cpu"]):
+        rc, _, e = await dock(node, "update", "--memory", f"{ram}g", "--memory-swap", f"{ram}g", "--cpus", str(cpu), n)
+        notes.append("🧠 RAM/CPU limits applied live." if rc == 0 else f"⚠️ docker update failed: `{e[-200:]}`")
+    elif ram != v["ram"] or cpu != v["cpu"]:
+        notes.append("🧠 RAM/CPU updated (shared mode – shown on panel).")
+    if add_days:
+        base = max(now(), datetime.fromisoformat(v["expires"])) if v["expires"] else now()
+        ex("UPDATE vps SET expires=? WHERE id=?", (base + timedelta(days=add_days)).isoformat(), v["id"])
+        notes.append(f"📅 Extended by **{add_days} days**.")
+    INFO_CACHE.pop(v["id"], None)
+    return notes
+
+
+async def deploy_flow(ctx, owner, ram, cpu, disk, free=False, days=None):
+    if not is_admin(owner):
+        lim, cnt = user_limit(owner.id), user_count(owner.id)
+        if cnt >= lim:
+            return await ctx.send(embed=simple("🚫 VPS limit reached", f"{owner.mention} has **{cnt}/{lim}** VPS.\n"
+                                               f"Admins can raise it with `{PREFIX}userlimit @user <n>`.", 0xE74C3C))
     node_id = await pick_node(ctx)
     if not node_id:
         return
@@ -402,7 +586,8 @@ async def deploy_flow(ctx, owner, ram, cpu, disk, free=False):
     if not image:
         return
     vid = uuid.uuid4().hex[:8]
-    exp = (now() + timedelta(days=EXPIRY_DAYS)).isoformat() if EXPIRY_DAYS else None
+    days = EXPIRY_DAYS if days is None else days
+    exp = (now() + timedelta(days=days)).isoformat() if days else None
     ex("INSERT INTO vps(id,owner,node_id,image,ram,cpu,disk,created,expires,free) VALUES(?,?,?,?,?,?,?,?,?,?)",
        vid, owner.id, node_id, image, ram, cpu, disk, now().isoformat(), exp, 1 if free else 0)
     v = get_vps(vid)
@@ -418,32 +603,132 @@ async def deploy_flow(ctx, owner, ram, cpu, disk, free=False):
         ex("DELETE FROM vps WHERE id=?", vid)
         return await msg.edit(embed=simple("❌ Creation failed", f"```{str(e)[:900]}```", 0xE74C3C))
     v = get_vps(vid)
-    text = (f"{owner.mention} your VPS is ready!\n**ID:** `{vid}` • **OS:** `{image}`\n"
-            f"**Spec:** {ram} GB RAM (shared) • {cpu} CPU (shared) • {disk} GB storage ({v['mode']})\n"
-            f"Use `{PREFIX}manage` to control it.")
+    # ---- full details + control panel go to the OWNER'S DM ----
+    det = discord.Embed(title="🌟 VPS Created Successfully", color=0x2ECC71)
+    det.add_field(name="➤ Owner", value=owner.mention, inline=True)
+    det.add_field(name="➤ VPS No / ID", value=f"#{vps_number(v)} • `{vid}`", inline=True)
+    det.add_field(name="➤ Container", value=f"`{cname(v)}`", inline=True)
+    det.add_field(name="➤ Node", value=get_node(v["node_id"])["name"], inline=False)
+    det.add_field(name="➤ Resources", value=f"**RAM:** {ram} GB (shared)\n**CPU:** {cpu} Cores (shared)\n"
+                                           f"**Storage:** {disk} GB ({v['mode']})", inline=False)
+    det.add_field(name="➤ OS", value=dict((b, a) for a, b in OS_OPTIONS).get(image, image), inline=True)
+    det.add_field(name="➤ Expires", value=fmt_exp(v), inline=True)
+    det.add_field(name="➤ Control", value=f"Use the buttons below, or `{PREFIX}manage` in any channel the bot "
+                                         f"can see or right here in DMs. Press **SSHX** to get your terminal link (sent here).",
+                  inline=False)
     if warn:
-        text += f"\n⚠️ {warn}"
-    await msg.edit(content=owner.mention, embed=simple("✅ VPS Created", text, 0x2ECC71))
+        det.add_field(name="⚠️ Note", value=warn[:500], inline=False)
+    if LOGO:
+        det.set_thumbnail(url=LOGO)
+    det.set_footer(text=footer_text())
+    det.timestamp = discord.utils.utcnow()
+    sent = False
+    try:
+        await owner.send(embed=det)
+        panel = Panel(vid, owner.id, admin_view=is_admin(owner), persistent=True)
+        pm = await owner.send(embed=await build_panel(v, 0), view=panel)
+        ex("UPDATE vps SET dm_msg=? WHERE id=?", pm.id, vid)
+        panel.start_live(pm)
+        sent = True
+    except discord.Forbidden:
+        sent = False
+    if sent:
+        await msg.edit(content=owner.mention, embed=simple(
+            "✅ VPS Created", f"{owner.mention} your VPS `{vid}` is ready!\n📩 Details and your control panel were sent to your **DMs**.", 0x2ECC71))
+    else:
+        await msg.edit(content=owner.mention, embed=simple(
+            "✅ VPS Created", f"{owner.mention} your VPS `{vid}` is ready, but I couldn't DM you.\n"
+                             f"Enable **Direct Messages** from server members, then use `{PREFIX}manage` to open your panel.", 0xF1C40F))
 
 # ───────────────────────────── manage panel ─────────────────────────────
 locks = {}
 
 
+class EditModal(discord.ui.Modal):
+    def __init__(self, v):
+        super().__init__(title=f"Edit VPS {v['id']}")
+        self.vid = v["id"]
+        self.ram = discord.ui.TextInput(label="RAM (GB)", default=str(v["ram"]), max_length=5)
+        self.cpu = discord.ui.TextInput(label="CPU cores", default=str(v["cpu"]), max_length=3)
+        self.disk = discord.ui.TextInput(label="Dedicated disk (GB, grow only)", default=str(v["disk"]), max_length=6)
+        self.days = discord.ui.TextInput(label="Extend expiry by days (0 = none)", default="0", max_length=4)
+        for c in (self.ram, self.cpu, self.disk, self.days):
+            self.add_item(c)
+
+    async def on_submit(self, i):
+        if not is_admin(i.user):
+            return await i.response.send_message("🚫 Admins only.", ephemeral=True)
+        try:
+            ram, cpu, disk, days = (int(x.value) for x in (self.ram, self.cpu, self.disk, self.days))
+            assert min(ram, cpu, disk) >= 1 and days >= 0
+        except (ValueError, AssertionError):
+            return await i.response.send_message("⚠️ Use whole numbers (RAM/CPU/disk ≥ 1).", ephemeral=True)
+        v = get_vps(self.vid)
+        if not v:
+            return await i.response.send_message("❌ VPS no longer exists.", ephemeral=True)
+        await i.response.defer(ephemeral=True, thinking=True)
+        notes = await apply_edit(v, ram, cpu, disk, days)
+        await i.followup.send(embed=simple("✅ VPS updated", "\n".join(notes) or "Saved.", 0x2ECC71), ephemeral=True)
+
+
 class Panel(discord.ui.View):
-    def __init__(self, vid, owner_id):
-        super().__init__(timeout=900)
-        self.vid, self.owner_id = vid, owner_id
+    def __init__(self, vid, owner_id, admin_view=False, persistent=False):
+        # persistent = DM panel: never times out, survives bot restarts
+        super().__init__(timeout=None if persistent else 900)
+        self.vid, self.owner_id, self.message, self.live, self.frame = vid, owner_id, None, None, 0
+        self.persistent = persistent
+        if not admin_view:
+            self.remove_item(self.b_renew)
+            self.remove_item(self.b_edit)
+
+    def start_live(self, message):
+        self.message = message
+        if self.live and not self.live.done():
+            return
+        self.live = asyncio.create_task(self._live())
+
+    async def _live(self):
+        deadline = time.time() + 900          # live refresh for 15 min, then press Refresh to resume
+        try:
+            while not self.is_finished() and time.time() < deadline:
+                await asyncio.sleep(LIVE_INTERVAL)
+                v = get_vps(self.vid)
+                if not v:
+                    return
+                lk = locks.get(v["id"])
+                if lk and lk.locked():
+                    continue
+                self.frame += 1
+                try:
+                    await self.message.edit(embed=await build_panel(v, self.frame))
+                except discord.NotFound:
+                    return
+                except Exception:
+                    log.debug("live edit failed", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+
+    async def on_timeout(self):
+        if self.live:
+            self.live.cancel()
+        for c in self.children:
+            c.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            pass
 
     async def interaction_check(self, i):
-        if i.user.id == self.owner_id or is_admin(i.user):
+        # ONLY the owner of the VPS can press anything on this panel
+        if i.user.id == self.owner_id:
             return True
-        await i.response.send_message("❌ This isn't your VPS.", ephemeral=True)
+        await i.response.send_message("❌ This isn't your VPS. Only the owner can control it.", ephemeral=True)
         return False
 
     async def redraw(self, i):
         v = get_vps(self.vid)
         if v:
-            await i.message.edit(embed=await build_panel(v), view=self)
+            await i.message.edit(embed=await build_panel(v, self.frame), view=self)
 
     async def act(self, i, action):
         v = get_vps(self.vid)
@@ -471,13 +756,20 @@ class Panel(discord.ui.View):
                 ok, err = await lifecycle(v, action)
                 if not ok:
                     await i.followup.send(f"❌ Could not {action}: `{err[:400]}`", ephemeral=True)
+            elif self.persistent and i.message:
+                self.start_live(i.message)       # resume live updates after pressing Refresh
             await self.redraw(i)
         elif action == "sshx":
             await i.response.defer(ephemeral=True, thinking=True)
             if (await info(v))["state"] != "running":
                 return await i.followup.send("❌ VPS is not running. Press **Start** first.", ephemeral=True)
             link = await sshx_link(v)
-            await i.followup.send(embed=simple("🌐 SSHX Session", f"{link}\n\nPress **SSHX** again for a brand-new session.", 0x7289DA), ephemeral=True)
+            try:   # the link is private: it goes to the owner's DM, never the channel
+                await i.user.send(embed=simple(f"🌐 SSHX Session • VPS {v['id']}",
+                                               f"{link}\n\nPress **SSHX** again for a brand-new session.", 0x7289DA))
+            except discord.Forbidden:
+                return await i.followup.send("❌ I can't DM you. Enable **Direct Messages** from server members and press **SSHX** again.", ephemeral=True)
+            await i.followup.send("📩 Your SSHX link was sent to your **DMs**.", ephemeral=True)
         elif action == "reinstall":
             pv = Picker(i.user.id, "Select new OS", os_options())
             await i.response.send_message("🐧 **Reinstall — choose the new OS** (all data will be wiped):", view=pv, ephemeral=True)
@@ -508,40 +800,64 @@ class Panel(discord.ui.View):
             await destroy(v)
             ex("DELETE FROM vps WHERE id=?", v["id"])
             await i.message.edit(content="🗑️ This VPS was deleted.", embed=None, view=None)
+            if self.live:
+                self.live.cancel()
             self.stop()
 
-    @discord.ui.button(label="Start", emoji="▶️", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(custom_id="vp_start", label="Start", emoji="▶️", style=discord.ButtonStyle.success, row=0)
     async def b_start(self, i, b):
         await self.act(i, "start")
 
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(custom_id="vp_stop", label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def b_stop(self, i, b):
         await self.act(i, "stop")
 
-    @discord.ui.button(label="Restart", emoji="🔁", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(custom_id="vp_restart", label="Restart", emoji="🔁", style=discord.ButtonStyle.primary, row=0)
     async def b_restart(self, i, b):
         await self.act(i, "restart")
 
-    @discord.ui.button(label="SSHX", emoji="❎", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(custom_id="vp_sshx", label="SSHX", emoji="❎", style=discord.ButtonStyle.secondary, row=0)
     async def b_sshx(self, i, b):
         await self.act(i, "sshx")
 
-    @discord.ui.button(label="Reinstall", emoji="🔴", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(custom_id="vp_reinstall", label="Reinstall", emoji="🔴", style=discord.ButtonStyle.secondary, row=1)
     async def b_reinstall(self, i, b):
         await self.act(i, "reinstall")
 
-    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(custom_id="vp_refresh", label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
     async def b_refresh(self, i, b):
         await self.act(i, "refresh")
 
-    @discord.ui.button(label="Delete", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(custom_id="vp_delete", label="Delete", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
     async def b_delete(self, i, b):
         await self.act(i, "delete")
+
+    @discord.ui.button(custom_id="vp_renew", label="Renew +30d", emoji="📅", style=discord.ButtonStyle.success, row=2)
+    async def b_renew(self, i, b):
+        if not is_admin(i.user):
+            return await i.response.send_message("🚫 Admins only.", ephemeral=True)
+        v = get_vps(self.vid)
+        if not v:
+            return await i.response.send_message("❌ VPS no longer exists.", ephemeral=True)
+        await apply_edit(v, v["ram"], v["cpu"], v["disk"], 30)
+        await i.response.send_message("✅ Renewed for 30 days. (Press **Start** if it was stopped.)", ephemeral=True)
+
+    @discord.ui.button(custom_id="vp_edit", label="Edit (Admin)", emoji="✏️", style=discord.ButtonStyle.primary, row=2)
+    async def b_edit(self, i, b):
+        if not is_admin(i.user):
+            return await i.response.send_message("🚫 Admins only.", ephemeral=True)
+        v = get_vps(self.vid)
+        if not v:
+            return await i.response.send_message("❌ VPS no longer exists.", ephemeral=True)
+        await i.response.send_modal(EditModal(v))
 
 # ───────────────────────────── bot + commands ─────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+
+VIEWS_LOADED = False
 
 
 @bot.event
@@ -550,9 +866,15 @@ async def on_ready():
     log.info("Logged in as %s | docker: %s", bot.user, o if rc == 0 else f"ERROR {e}")
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS is empty - nobody can use admin commands!")
-    if not expiry_task.is_running():
-        expiry_task.start()
-    await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help • {BRAND}"))
+    global VIEWS_LOADED
+    if not VIEWS_LOADED:   # re-attach DM control panels so their buttons keep working after a restart
+        VIEWS_LOADED = True
+        for r in q("SELECT id, owner, dm_msg FROM vps WHERE dm_msg IS NOT NULL"):
+            bot.add_view(Panel(r["id"], r["owner"], admin_view=r["owner"] in ADMIN_IDS, persistent=True), message_id=r["dm_msg"])
+    await refresh_fleet()
+    for t in (expiry_task, fleet_task, presence_task, dash_task):
+        if not t.is_running():
+            t.start()
 
 
 @bot.event
@@ -568,6 +890,47 @@ async def on_command_error(ctx, err):
     await ctx.send(f"❌ Error: `{str(err)[:300]}`")
 
 
+@tasks.loop(seconds=10)
+async def fleet_task():
+    global TICK
+    TICK += 1
+    try:
+        await refresh_fleet()
+    except Exception:
+        log.exception("fleet refresh failed")
+
+
+PRES = 0
+
+
+@tasks.loop(seconds=20)
+async def presence_task():
+    global PRES
+    PRES += 1
+    f = FLEET
+    texts = [f"{f['total']}/{f['cap']} VPS | {f['running']} Running", f"{PREFIX}help • {BRAND}", f"Made by {CREDIT}"]
+    await bot.change_presence(status=discord.Status.online,
+                              activity=discord.Activity(type=discord.ActivityType.watching, name=texts[PRES % len(texts)]))
+
+
+@tasks.loop(seconds=10)
+async def dash_task():
+    items = [x for x in get_set("dashboards", "").split(",") if ":" in x]
+    keep = []
+    for it in items:
+        cid, mid = it.split(":")
+        try:
+            ch = bot.get_channel(int(cid)) or await bot.fetch_channel(int(cid))
+            await (await ch.fetch_message(int(mid))).edit(embed=build_dashboard())
+            keep.append(it)
+        except (discord.NotFound, discord.Forbidden):
+            pass
+        except Exception:
+            keep.append(it)
+    if len(keep) != len(items):
+        put_set("dashboards", ",".join(keep))
+
+
 @tasks.loop(minutes=10)
 async def expiry_task():
     for v in q("SELECT * FROM vps WHERE expires IS NOT NULL AND expires < ? AND purge=0", now().isoformat()):
@@ -577,14 +940,20 @@ async def expiry_task():
 @bot.command(name="help")
 async def help_cmd(ctx):
     p = PREFIX
-    e = simple(f"{BRAND} VPS Bot", "", 0x5865F2)
-    e.add_field(name="👤 Users", value=(f"`{p}manage` – manage your VPS (start/stop/restart/SSHX/reinstall/delete)\n"
+    e = simple(f"{BRAND} VPS Bot", f"Made by **{CREDIT}**", 0x5865F2)
+    e.add_field(name="👤 Users", value=(f"`{p}manage` – your own LIVE panel (works in servers and DMs; SSHX link arrives in DM)\n"
                                          f"`{p}list` – your VPS list\n`{p}deploy` – free VPS (when enabled)\n"
                                          f"`{p}ping` • `{p}uptime`"), inline=False)
-    e.add_field(name="🛠️ Admins", value=(f"`{p}create <ram> <cpu> <storage> @user`\n`{p}delete-vps @user <vps_id>`\n"
+    e.add_field(name="🛠️ Admins", value=(f"`{p}create <ram> <cpu> <storage> @user [days]` – any capacity\n"
+                                          f"`{p}editvps <vps_id> <ram> <cpu> <disk>` – edit a user's VPS (disk grows live)\n"
+                                          f"`{p}renew <vps_id> <days>` • `{p}delete-vps @user <vps_id>`\n"
+                                          f"`{p}userlimit @user [n|reset]` – per-user VPS limit\n"
+                                          f"`{p}defaultlimit [n]` – default limit for everyone\n"
+                                          f"`{p}dashboard [stop]` – live fleet dashboard\n"
                                           f"`{p}freedeploy enable|disable|spec <ram> <cpu> <disk>|limit <n>`\n"
-                                          f"`{p}renew <vps_id> <days>` • `{p}purge-protect <vps_id> on|off`\n"
+                                          f"`{p}purge-protect <vps_id> on|off`\n"
                                           f"`{p}node-add <name> <docker_host> [max]` • `{p}node-list` • `{p}node-remove <id>`"), inline=False)
+    e.set_footer(text=footer_text())
     await ctx.send(embed=e)
 
 
@@ -593,7 +962,8 @@ async def ping(ctx):
     t = time.perf_counter()
     m = await ctx.send("🏓 Pinging…")
     rtt = (time.perf_counter() - t) * 1000
-    await m.edit(content=None, embed=simple("🏓 Pong!", f"**WebSocket:** `{bot.latency * 1000:.0f} ms`\n**Message round-trip:** `{rtt:.0f} ms`", 0x2ECC71))
+    nodes = "\n".join(f"{'🟢' if n['ok'] else '🔴'} {n['name']}: `{ms(n['ms'])}`" for n in FLEET["nodes"])
+    await m.edit(content=None, embed=simple("🏓 Pong!", f"**WebSocket:** `{bot.latency * 1000:.0f} ms`\n**Message round-trip:** `{rtt:.0f} ms`\n{nodes}", 0x2ECC71))
 
 
 @bot.command(name="uptime")
@@ -607,8 +977,8 @@ async def uptime(ctx):
 
 
 @bot.command(name="manage")
-async def manage(ctx, user: discord.User = None):
-    target = user if (user and is_admin(ctx.author)) else ctx.author
+async def manage(ctx):
+    target = ctx.author          # everyone (admins too) can only open THEIR OWN panel
     rows = q("SELECT * FROM vps WHERE owner=? ORDER BY rowid", target.id)
     if not rows:
         return await ctx.send(embed=simple("❌ No VPS", f"{target.mention} has no VPS.", 0xE74C3C))
@@ -622,7 +992,9 @@ async def manage(ctx, user: discord.User = None):
         if not vid:
             return await m.delete()
         v = get_vps(vid)
-    await ctx.send(embed=await build_panel(v), view=Panel(v["id"], target.id))
+    panel = Panel(v["id"], target.id, admin_view=is_admin(ctx.author))
+    msg = await ctx.send(embed=await build_panel(v, 0), view=panel)
+    panel.start_live(msg)
 
 
 @bot.command(name="list")
@@ -635,16 +1007,20 @@ async def list_cmd(ctx, user: discord.User = None):
         rows = q("SELECT * FROM vps WHERE owner=? ORDER BY rowid", ctx.author.id)
     if not rows:
         return await ctx.send("📭 No VPS found.")
+    if not is_admin(ctx.author):
+        rows_note = f"\n\n📦 Your limit: **{len(rows)}/{user_limit(ctx.author.id)}** VPS"
+    else:
+        rows_note = ""
     lines = [f"`{r['id']}` <@{r['owner']}> • {r['image']} • {r['ram']}GB/{r['cpu']}c/{r['disk']}GB • node {r['node_id']} • {fmt_exp(r)}" for r in rows]
-    await ctx.send(embed=simple("🖥️ VPS List", "\n".join(lines)[:4000]))
+    await ctx.send(embed=simple("🖥️ VPS List", ("\n".join(lines)[:3800]) + rows_note))
 
 
 @bot.command(name="create")
 @admin_only
-async def create(ctx, ram: int, cpu: int, storage: int, user: discord.User):
-    if min(ram, cpu, storage) < 1:
+async def create(ctx, ram: int, cpu: int, storage: int, user: discord.User, days: int = None):
+    if min(ram, cpu, storage) < 1 or (days is not None and days < 0):
         return await ctx.send("⚠️ RAM, CPU and storage must be at least 1.")
-    await deploy_flow(ctx, user, ram, cpu, storage)
+    await deploy_flow(ctx, user, ram, cpu, storage, days=days)
 
 
 @bot.command(name="deploy")
@@ -716,6 +1092,53 @@ async def renew(ctx, vps_id: str, days: int):
     base = max(now(), datetime.fromisoformat(v["expires"])) if v["expires"] else now()
     ex("UPDATE vps SET expires=? WHERE id=?", (base + timedelta(days=days)).isoformat(), vps_id)
     await ctx.send(embed=simple("✅ Renewed", f"`{vps_id}` extended by {days} days.", 0x2ECC71))
+
+
+@bot.command(name="editvps")
+@admin_only
+async def editvps(ctx, vps_id: str, ram: int, cpu: int, disk: int):
+    v = get_vps(vps_id)
+    if not v:
+        return await ctx.send("❌ VPS not found.")
+    if min(ram, cpu, disk) < 1:
+        return await ctx.send("⚠️ Values must be at least 1.")
+    notes = await apply_edit(v, ram, cpu, disk)
+    await ctx.send(embed=simple("✅ VPS updated", f"`{vps_id}` → {ram} GB RAM • {cpu} CPU • {get_vps(vps_id)['disk']} GB disk\n" + "\n".join(notes), 0x2ECC71))
+
+
+@bot.command(name="userlimit")
+@admin_only
+async def userlimit(ctx, user: discord.User, n: str = None):
+    if n is None:
+        return await ctx.send(embed=simple("📦 User limit", f"{user.mention}: **{user_count(user.id)}/{user_limit(user.id)}** VPS"))
+    if n.lower() == "reset":
+        ex("DELETE FROM user_limits WHERE user_id=?", user.id)
+        return await ctx.send(embed=simple("✅ Limit reset", f"{user.mention} now uses the default ({get_set('default_limit', str(DEFAULT_LIMIT))}).", 0x2ECC71))
+    if not n.isdigit():
+        return await ctx.send(f"⚠️ Usage: `{PREFIX}userlimit @user <number|reset>`")
+    ex("INSERT INTO user_limits(user_id,max_vps) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET max_vps=excluded.max_vps", user.id, int(n))
+    await ctx.send(embed=simple("✅ Limit set", f"{user.mention} can have up to **{n}** VPS (has {user_count(user.id)}).", 0x2ECC71))
+
+
+@bot.command(name="defaultlimit")
+@admin_only
+async def defaultlimit(ctx, n: int = None):
+    if n is None:
+        return await ctx.send(embed=simple("📦 Default limit", f"**{get_set('default_limit', str(DEFAULT_LIMIT))}** VPS per user (admins exempt)."))
+    put_set("default_limit", max(0, n))
+    await ctx.send(embed=simple("✅ Default limit updated", f"Everyone without a custom limit: **{max(0, n)}** VPS.", 0x2ECC71))
+
+
+@bot.command(name="dashboard")
+@admin_only
+async def dashboard(ctx, action: str = ""):
+    items = [x for x in get_set("dashboards", "").split(",") if ":" in x]
+    if action == "stop":
+        put_set("dashboards", ",".join(x for x in items if not x.startswith(f"{ctx.channel.id}:")))
+        return await ctx.send("🛑 Dashboards in this channel stopped (delete the message to remove it).")
+    await refresh_fleet()
+    m = await ctx.send(embed=build_dashboard())
+    put_set("dashboards", ",".join(items + [f"{ctx.channel.id}:{m.id}"]))
 
 
 @bot.command(name="purge-protect")
