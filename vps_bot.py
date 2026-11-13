@@ -46,6 +46,7 @@ db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS user_limits(user_id INTEGER PRIMARY KEY, max_vps INTEGER);
+CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT);
 CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT DEFAULT '', max_vps INTEGER DEFAULT 50);
 CREATE TABLE IF NOT EXISTS vps(id TEXT PRIMARY KEY, owner INTEGER, node_id INTEGER, image TEXT,
   ram INTEGER, cpu INTEGER, disk INTEGER, mode TEXT DEFAULT 'opt', created TEXT, expires TEXT,
@@ -110,8 +111,13 @@ def cname(v):
     return f"vps-{v['id']}"
 
 
+def is_admin_id(uid):
+    """Owner admins (ADMIN_IDS in .env) + admins added in chat with admin-add."""
+    return uid in ADMIN_IDS or bool(q("SELECT 1 FROM admins WHERE user_id=?", uid))
+
+
 def is_admin(user):
-    return user.id in ADMIN_IDS
+    return is_admin_id(user.id)
 
 
 admin_only = commands.check(lambda ctx: is_admin(ctx.author))
@@ -870,7 +876,7 @@ async def on_ready():
     if not VIEWS_LOADED:   # re-attach DM control panels so their buttons keep working after a restart
         VIEWS_LOADED = True
         for r in q("SELECT id, owner, dm_msg FROM vps WHERE dm_msg IS NOT NULL"):
-            bot.add_view(Panel(r["id"], r["owner"], admin_view=r["owner"] in ADMIN_IDS, persistent=True), message_id=r["dm_msg"])
+            bot.add_view(Panel(r["id"], r["owner"], admin_view=is_admin_id(r["owner"]), persistent=True), message_id=r["dm_msg"])
     await refresh_fleet()
     for t in (expiry_task, fleet_task, presence_task, dash_task):
         if not t.is_running():
@@ -952,7 +958,9 @@ async def help_cmd(ctx):
                                           f"`{p}dashboard [stop]` – live fleet dashboard\n"
                                           f"`{p}freedeploy enable|disable|spec <ram> <cpu> <disk>|limit <n>`\n"
                                           f"`{p}purge-protect <vps_id> on|off`\n"
-                                          f"`{p}node-add <name> <docker_host> [max]` • `{p}node-list` • `{p}node-remove <id>`"), inline=False)
+                                          f"`{p}admin-add @user` • `{p}admin-remove @user` • `{p}admin-list`\n"
+                                          f"`{p}node-add <name> <docker_host> [max]` • `{p}node-list` • `{p}node-remove <id>`\n"
+                                          f"`{p}node-limit <id> <max>` – change a node's VPS capacity"), inline=False)
     e.set_footer(text=footer_text())
     await ctx.send(embed=e)
 
@@ -1150,6 +1158,36 @@ async def purge_protect(ctx, vps_id: str, state: str):
     await ctx.send(f"🔒 Purge protection for `{vps_id}`: **{state.lower()}**")
 
 
+@bot.command(name="admin-add", aliases=["adminadd"])
+@admin_only
+async def admin_add(ctx, user: discord.User):
+    if user.bot:
+        return await ctx.send("⚠️ You can't make a bot an admin.")
+    if is_admin_id(user.id):
+        return await ctx.send(embed=simple("ℹ️ Already admin", f"{user.mention} is already an admin.", 0xF1C40F))
+    ex("INSERT INTO admins(user_id,added_by,added_at) VALUES(?,?,?)", user.id, ctx.author.id, now().isoformat())
+    await ctx.send(embed=simple("✅ Admin added", f"{user.mention} is now an admin.\nAdded by {ctx.author.mention}.", 0x2ECC71))
+
+
+@bot.command(name="admin-remove", aliases=["adminremove"])
+@admin_only
+async def admin_remove(ctx, user: discord.User):
+    if user.id in ADMIN_IDS:
+        return await ctx.send("🚫 That user is an owner admin (set in `.env`) and can't be removed from chat.")
+    if not q("SELECT 1 FROM admins WHERE user_id=?", user.id):
+        return await ctx.send(embed=simple("❌ Not an admin", f"{user.mention} is not a chat-added admin.", 0xE74C3C))
+    ex("DELETE FROM admins WHERE user_id=?", user.id)
+    await ctx.send(embed=simple("✅ Admin removed", f"{user.mention} is no longer an admin.", 0x2ECC71))
+
+
+@bot.command(name="admin-list", aliases=["adminlist"])
+@admin_only
+async def admin_list(ctx):
+    owners = [f"👑 <@{i}> (owner)" for i in sorted(ADMIN_IDS)]
+    added = [f"🛡️ <@{r['user_id']}> • added by <@{r['added_by']}>" for r in q("SELECT * FROM admins ORDER BY rowid")]
+    await ctx.send(embed=simple("🛡️ Admins", "\n".join(owners + added) or "No admins."))
+
+
 @bot.command(name="node-add")
 @admin_only
 async def node_add(ctx, name: str, host: str, max_vps: int = 50):
@@ -1168,6 +1206,25 @@ async def node_list(ctx):
     lines = [f"`{n['id']}` **{n['name']}** • `{n['host'] or 'local'}` • "
              f"{q('SELECT COUNT(*) c FROM vps WHERE node_id=?', n['id'])[0]['c']}/{n['max_vps']}" for n in q("SELECT * FROM nodes")]
     await ctx.send(embed=simple("🖧 Nodes", "\n".join(lines)))
+
+
+@bot.command(name="node-limit", aliases=["nodelimit"])
+@admin_only
+async def node_limit(ctx, node_id: int, max_vps: int = None):
+    """2node-limit <node_id> <new_max>  - change a node's VPS capacity (the '50' in 'x/50')"""
+    nd = get_node(node_id)
+    if not nd:
+        return await ctx.send(embed=simple("❌ Node not found", f"No node with ID `{node_id}`. Use `{PREFIX}node-list`.", 0xE74C3C))
+    used = q("SELECT COUNT(*) c FROM vps WHERE node_id=?", node_id)[0]["c"]
+    if max_vps is None:
+        return await ctx.send(embed=simple("📦 Node limit", f"**{nd['name']}**: `{used}/{nd['max_vps']}` VPS\nChange it with `{PREFIX}node-limit {node_id} <number>`."))
+    if max_vps < 1:
+        return await ctx.send("⚠️ Limit must be at least 1.")
+    if max_vps < used:
+        return await ctx.send(embed=simple("⚠️ Too low", f"**{nd['name']}** already has **{used}** VPS. Choose **{used}** or more (or delete some VPS first).", 0xF1C40F))
+    ex("UPDATE nodes SET max_vps=? WHERE id=?", max_vps, node_id)
+    await refresh_fleet()
+    await ctx.send(embed=simple("✅ Node limit updated", f"**{nd['name']}** capacity: `{nd['max_vps']}` → `{max_vps}` (using {used}).", 0x2ECC71))
 
 
 @bot.command(name="node-remove")
